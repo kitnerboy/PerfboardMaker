@@ -502,6 +502,38 @@ def _classify_pin_type(name: str, conn_type: str) -> str:
     return "io"
 
 
+def _read_fzpz_bytes(data: bytes) -> tuple[bytes, bytes]:
+    """Extracts (.fzp bytes, breadboard .svg bytes) from .fzpz archive bytes."""
+    with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+        names = zf.namelist()
+        fzp_names = [n for n in names if n.lower().endswith(".fzp")]
+        if not fzp_names:
+            raise ValueError("Missing .fzp inside .fzpz archive")
+        fzp_bytes = zf.read(fzp_names[0])
+        fzp_root = ET.fromstring(fzp_bytes)
+        bb_layers = fzp_root.find("./views/breadboardView/layers")
+        if bb_layers is None or not bb_layers.get("image"):
+            raise ValueError("Part has no breadboard view")
+        bb_img = bb_layers.get("image", "")
+        expected_svg_name = "svg." + bb_img.replace("/", ".")
+        svg_name = None
+        if expected_svg_name in names:
+            svg_name = expected_svg_name
+        else:
+            base_name = os.path.basename(bb_img).lower()
+            matches = [
+                n for n in names
+                if n.lower().endswith(".svg") and (
+                    n.lower().endswith(base_name) or "breadboard" in n.lower()
+                )
+            ]
+            if matches:
+                svg_name = matches[0]
+        if svg_name is None:
+            raise ValueError("Missing breadboard .svg inside .fzpz archive")
+        return fzp_bytes, zf.read(svg_name)
+
+
 def _download_candidate_files(entry: FritzingCatalogEntry) -> tuple[bytes, bytes]:
     """Downloads (.fzp bytes, breadboard .svg bytes) for a FritzingCatalogEntry."""
     encoded_path = urllib.parse.quote(entry.path, safe="/")
@@ -509,34 +541,7 @@ def _download_candidate_files(entry: FritzingCatalogEntry) -> tuple[bytes, bytes
     data = _http_get_bytes(raw_url, timeout=10.0)
 
     if entry.kind == "fzpz":
-        with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
-            names = zf.namelist()
-            fzp_names = [n for n in names if n.lower().endswith(".fzp")]
-            if not fzp_names:
-                raise ValueError("Missing .fzp inside .fzpz archive")
-            fzp_bytes = zf.read(fzp_names[0])
-            fzp_root = ET.fromstring(fzp_bytes)
-            bb_layers = fzp_root.find("./views/breadboardView/layers")
-            if bb_layers is None or not bb_layers.get("image"):
-                raise ValueError("Part has no breadboard view")
-            bb_img = bb_layers.get("image", "")
-            expected_svg_name = "svg." + bb_img.replace("/", ".")
-            svg_name = None
-            if expected_svg_name in names:
-                svg_name = expected_svg_name
-            else:
-                base_name = os.path.basename(bb_img).lower()
-                matches = [
-                    n for n in names
-                    if n.lower().endswith(".svg") and (
-                        n.lower().endswith(base_name) or "breadboard" in n.lower()
-                    )
-                ]
-                if matches:
-                    svg_name = matches[0]
-            if svg_name is None:
-                raise ValueError("Missing breadboard .svg inside .fzpz archive")
-            return fzp_bytes, zf.read(svg_name)
+        return _read_fzpz_bytes(data)
 
     # core_fzp
     fzp_bytes = data
@@ -726,7 +731,7 @@ def parse_and_validate_fritzing_part(
     title = (fzp_root.findtext("title") or entry.display_name).strip()
     label = (fzp_root.findtext("label") or "U").strip() or "U"
     author = (fzp_root.findtext("author") or entry.source_name).strip()
-    url = (fzp_root.findtext("url") or f"https://github.com/{entry.repo}").strip()
+    url = (fzp_root.findtext("url") or (f"https://github.com/{entry.repo}" if entry.repo else "")).strip()
     raw_desc = (fzp_root.findtext("description") or "").strip()
     clean_desc = re.sub(r"<[^>]+>", " ", raw_desc)
     clean_desc = re.sub(r"\s+", " ", clean_desc).strip()
@@ -760,12 +765,76 @@ def parse_and_validate_fritzing_part(
             "path": entry.path,
             "author": author,
             "url": url,
-            "license": "CC BY-SA",
+            "license": "CC BY-SA" if entry.repo else "Unknown",
         },
         is_remote_preview=True,
         off_grid_pins=off_grid_pins,
     )
     return comp_def, None
+
+
+_MAX_LOCAL_FILE_BYTES = 25 * 1024 * 1024
+
+
+def _read_local_fzp_with_svg(fzp_path: str) -> tuple[bytes, bytes]:
+    """Reads a loose .fzp and locates its breadboard SVG next to it or in a fritzing-parts style tree."""
+    with open(fzp_path, "rb") as f:
+        fzp_bytes = f.read()
+    fzp_root = ET.fromstring(fzp_bytes)
+    bb_layers = fzp_root.find("./views/breadboardView/layers")
+    if bb_layers is None or not bb_layers.get("image"):
+        raise ValueError("Part has no breadboard view")
+    bb_img = bb_layers.get("image", "").lstrip("/")
+    base_dir = os.path.dirname(os.path.abspath(fzp_path))
+
+    candidates = [
+        os.path.join(base_dir, bb_img),
+        os.path.join(base_dir, os.path.basename(bb_img)),
+    ]
+    # fritzing-parts layout: <root>/pdb/x.fzp with <root>/svg/{core,contrib,user,obsolete}/<image>
+    parent = os.path.dirname(base_dir)
+    for sub in ("core", "contrib", "user", "obsolete"):
+        candidates.append(os.path.join(parent, "svg", sub, bb_img))
+    candidates.append(os.path.join(parent, "svg", bb_img))
+
+    for cand in candidates:
+        if os.path.isfile(cand):
+            with open(cand, "rb") as f:
+                return fzp_bytes, f.read()
+    raise ValueError(f"Breadboard SVG '{bb_img}' not found next to the .fzp file")
+
+
+def import_fritzing_file(path: str) -> tuple[FritzingComponentDef | None, str | None]:
+    """
+    Imports a local .fzpz archive, or a .fzp with its breadboard SVG alongside it.
+    Returns (component, None) if 2.54 mm compatible, else (None, reason).
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in (".fzpz", ".fzp"):
+        return None, "Unsupported file type (expected .fzpz or .fzp)"
+    try:
+        if os.path.getsize(path) > _MAX_LOCAL_FILE_BYTES:
+            return None, "File is too large"
+        if ext == ".fzpz":
+            with open(path, "rb") as f:
+                fzp_bytes, svg_bytes = _read_fzpz_bytes(f.read())
+        else:
+            fzp_bytes, svg_bytes = _read_local_fzp_with_svg(path)
+    except (OSError, ValueError, zipfile.BadZipFile, ET.ParseError) as exc:
+        return None, str(exc)
+
+    stem = re.sub(r"[^a-zA-Z0-9]+", "_", os.path.splitext(os.path.basename(path))[0]).strip("_").lower()[:36] or "part"
+    digest = hashlib.sha1(fzp_bytes + svg_bytes).hexdigest()[:8]
+    entry = FritzingCatalogEntry(
+        source_name="Local",
+        repo="",
+        branch="",
+        kind="fzpz" if ext == ".fzpz" else "local_fzp",
+        path=os.path.abspath(path),
+        display_name=_clean_display_name(path),
+        type_id=f"fritzing_{stem}_{digest}",
+    )
+    return parse_and_validate_fritzing_part(entry, fzp_bytes, svg_bytes)
 
 
 def search_compatible_fritzing_parts(

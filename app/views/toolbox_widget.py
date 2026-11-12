@@ -4,18 +4,20 @@ click-to-place, and debounced online Fritzing compatibility search.
 """
 from __future__ import annotations
 
+import os
 import threading
 from PyQt6.QtCore import Qt, QMimeData, QObject, QPoint, QRectF, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QCursor, QDrag, QFont, QPainter, QPixmap
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QLineEdit, QScrollArea, QVBoxLayout, QWidget
+    QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QScrollArea, QVBoxLayout, QWidget
 )
 
 from app.components.fritzing_part import FritzingComponentDef
 from app.components.registry import REGISTRY
 from app.models.component_def import ComponentDef
 from app.models.placed_component import PlacedComponent
-from app.utils.fritzing_importer import search_compatible_fritzing_parts
+from app.utils.fritzing_importer import import_fritzing_file, search_compatible_fritzing_parts
 
 
 class _OnlineSearchSignals(QObject):
@@ -178,6 +180,11 @@ class ToolboxWidget(QWidget):
         self.search_box.returnPressed.connect(self._on_search_return_pressed)
         main_layout.addWidget(self.search_box)
 
+        self.import_btn = QPushButton("📂 Import Fritzing part from file...")
+        self.import_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.import_btn.clicked.connect(self._on_import_file_clicked)
+        main_layout.addWidget(self.import_btn)
+
         hint_lbl = QLabel("💡 Drag onto board or click to place. Online compatible parts appear 2s after pausing typing.")
         hint_lbl.setFont(QFont("Arial", 8))
         hint_lbl.setWordWrap(True)
@@ -302,6 +309,32 @@ class ToolboxWidget(QWidget):
 
         self._populate_components()
         self._filter_components(self.search_box.text())
+
+    def _on_import_file_clicked(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Import Fritzing Part", "",
+            "Fritzing Parts (*.fzpz *.fzp);;All Files (*)",
+        )
+        imported: list[str] = []
+        failures: list[str] = []
+        for path in paths:
+            comp_def, reason = import_fritzing_file(path)
+            name = os.path.basename(path)
+            if comp_def is None:
+                failures.append(f"{name}: {reason}")
+            elif REGISTRY.is_installed(comp_def.type_id):
+                failures.append(f"{name}: already imported")
+            else:
+                REGISTRY.register_preview(comp_def)
+                REGISTRY.persist_if_remote(comp_def.type_id)
+                imported.append(comp_def.name)
+
+        if failures:
+            QMessageBox.warning(self, "Import Fritzing Part", "\n".join(failures))
+        elif imported:
+            QMessageBox.information(
+                self, "Import Fritzing Part", "Imported: " + ", ".join(imported)
+            )
 
     def _on_search_text_changed(self, query: str):
         self._filter_components(query)
